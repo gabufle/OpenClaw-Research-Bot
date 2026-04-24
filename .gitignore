@@ -2,6 +2,7 @@
 # 1. SECRETS & CREDENTIALS (CRITICAL)
 # =========================
 .env
+keys.env 
 .env.local
 .env.*
 *.pem
