@@ -1,0 +1,54 @@
+# =========================
+# 1. SECRETS & CREDENTIALS (CRITICAL)
+# =========================
+.env
+.env.local
+.env.*
+*.pem
+# (Note: .env.example is NOT ignored so users can see the template)
+
+# =========================
+# 2. PYTHON (The Academic Scraper)
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# =========================
+# 3. NODE.JS (OpenClaw Environment)
+# =========================
+node_modules/
+npm-debug.log
+yarn-error.log
+.npm/
+
+# =========================
+# 4. BOT DATA & LOCAL OUTPUTS
+# =========================
+# Ignore the directories where your bot saves the daily downloaded abstracts
+data/
+downloads/
+temp/
+output/
+
+# Ignore local databases or logs OpenClaw might generate
+*.sqlite
+*.sqlite3
+*.db
+*.log
+logs/
+
+# =========================
+# 5. OS & IDE FILES
+# =========================
+# Even if you are on Windows, ignoring Mac files is standard practice
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
