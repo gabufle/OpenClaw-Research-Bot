@@ -2,8 +2,68 @@ import requests
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
-import subprocess
 import os
+import secrets
+
+MODEL_NAME = "gemini-2.5-flash"
+PENDING_PAYLOAD_PATH = os.path.join("data", "pending_gemini_payload.json")
+LATEST_EVALUATION_PATH = os.path.join("data", "latest_evaluation.json")
+MAX_LINKS_IN_PROMPT = 15
+
+# JSON schema for structured evaluation (Gemini REST: generationConfig.responseJsonSchema)
+EVALUATION_RESPONSE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "generatedAt": {
+            "type": "string",
+            "description": "ISO-8601 timestamp when this evaluation was produced.",
+        },
+        "topPapers": {
+            "type": "array",
+            "maxItems": 5,
+            "description": "Ranked papers, highest score first (at most 5).",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "rank": {"type": "integer", "description": "1-based rank."},
+                    "title": {"type": "string"},
+                    "authors": {"type": "string"},
+                    "source": {"type": "string", "description": "Source label, e.g. arXiv or PubMed."},
+                    "url": {"type": "string"},
+                    "score": {
+                        "type": "integer",
+                        "description": "Integer from 0 to 100 inclusive.",
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "rank",
+                    "title",
+                    "authors",
+                    "source",
+                    "url",
+                    "score",
+                    "reason",
+                ],
+            },
+        },
+    },
+    "required": ["generatedAt", "topPapers"],
+}
+
+
+def strip_yaml_frontmatter(markdown_text):
+    """Remove leading OpenClaw-style YAML frontmatter (--- ... ---) from skill files."""
+    if not markdown_text.startswith("---"):
+        return markdown_text
+    lines = markdown_text.splitlines()
+    if len(lines) < 2 or lines[0].strip() != "---":
+        return markdown_text
+    for idx in range(1, min(len(lines), 50)):
+        if lines[idx].strip() == "---":
+            return "\n".join(lines[idx + 1 :]).lstrip("\n")
+    return markdown_text
+
 
 # ==========================================
 # 1. THE ADAPTERS (Database-Specific Fetchers)
@@ -61,7 +121,7 @@ def fetch_arxiv_papers(search_query, max_results=5):
 
 def fetch_pubmed_papers(search_term, max_results=5):
     """Fetches papers from PubMed API (NCBI E-utilities) and normalizes output."""
-    print(f"📡 Fetching from PubMed: {search_term}...")
+    print(f" Fetching from PubMed: {search_term}...")
     # PubMed requires a two-step process: ESearch to get IDs, ESummary to get details
     # ... API request logic goes here ...
     
@@ -130,6 +190,181 @@ def fetch_pubmed_papers(search_term, max_results=5):
     return normalized_results
 
 
+def build_compact_paper_list(papers, limit=MAX_LINKS_IN_PROMPT):
+    compact = []
+    for index, paper in enumerate(papers[:limit], start=1):
+        compact.append({
+            "index": index,
+            "source": paper.get("source", "Unknown"),
+            "title": paper.get("title", "Untitled"),
+            "authors": paper.get("authors", "Unknown Authors"),
+            "url": paper.get("url", ""),
+        })
+    return compact
+
+
+def build_gemini_payload(rubric_prompt, compact_papers):
+    prompt = (
+        "Evaluate the following paper candidates using the system rubric. "
+        "Use only the metadata and URLs provided (you cannot fetch URLs). "
+        "Scores must be integers from 0 through 100.\n\n"
+        "Return JSON matching the enforced response schema only. "
+        "Include at most 5 items in topPapers, ranked best-first. "
+        "Keep each reason under 280 characters. "
+        "If no paper scores above 60, set topPapers to an empty array.\n\n"
+        f"Papers:\n{json.dumps(compact_papers, indent=2)}"
+    )
+    return {
+        "system_instruction": {
+            "parts": [{"text": rubric_prompt}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 8192,
+            "responseMimeType": "application/json",
+            "responseJsonSchema": EVALUATION_RESPONSE_JSON_SCHEMA,
+        },
+    }
+
+
+def save_pending_payload(gemini_url, payload):
+    os.makedirs("data", exist_ok=True)
+    pending = {
+        "gemini_url": gemini_url,
+        "payload": payload,
+        "saved_at": datetime.now().isoformat(),
+    }
+    with open(PENDING_PAYLOAD_PATH, "w", encoding="utf-8") as pending_file:
+        json.dump(pending, pending_file, indent=2)
+
+
+def save_latest_evaluation(evaluation_data):
+    os.makedirs("data", exist_ok=True)
+    with open(LATEST_EVALUATION_PATH, "w", encoding="utf-8") as output_file:
+        json.dump(evaluation_data, output_file, indent=2)
+
+
+def parse_gemini_json_response(ai_evaluation):
+    try:
+        return json.loads(ai_evaluation)
+    except json.JSONDecodeError:
+        start = ai_evaluation.find("{")
+        end = ai_evaluation.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(ai_evaluation[start:end + 1])
+        raise
+
+
+def overwrite_then_delete(path):
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    with open(path, "wb") as file_obj:
+        if size > 0:
+            file_obj.write(secrets.token_bytes(size))
+            file_obj.flush()
+    os.remove(path)
+
+
+def send_gemini_request(gemini_url, payload):
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(gemini_url, headers=headers, json=payload, timeout=120)
+    response.raise_for_status()
+    return response
+
+
+def extract_gemini_candidate_text(body):
+    """Concatenate all `text` parts from the first candidate (Gemini may split JSON across parts)."""
+    candidates = body.get("candidates") or []
+    if not candidates:
+        return ""
+    cand = candidates[0]
+    content = cand.get("content") or {}
+    parts = content.get("parts") or []
+    texts = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("text"):
+            texts.append(part["text"])
+    joined = "".join(texts)
+    return joined
+
+
+def consume_pending_payload():
+    """Retry a saved Gemini request. Never raises: returns True on success, False otherwise."""
+    if not os.path.exists(PENDING_PAYLOAD_PATH):
+        return False
+
+    try:
+        with open(PENDING_PAYLOAD_PATH, "r", encoding="utf-8") as pending_file:
+            pending_data = json.load(pending_file)
+    except json.JSONDecodeError as exc:
+        print(f"\n Pending payload file is not valid JSON ({exc}). Skipping retry; fix or delete {PENDING_PAYLOAD_PATH}")
+        return False
+    except OSError as exc:
+        print(f"\n Could not read pending payload file: {exc}")
+        return False
+
+    if not isinstance(pending_data, dict):
+        print(f"\n Pending payload must be a JSON object. Skipping retry; check {PENDING_PAYLOAD_PATH}")
+        return False
+    try:
+        gemini_url = pending_data["gemini_url"]
+        payload = pending_data["payload"]
+    except KeyError as exc:
+        print(f"\n Pending payload missing required key {exc!r}. Skipping retry; check {PENDING_PAYLOAD_PATH}")
+        return False
+
+    print("\n Found pending Gemini payload. Retrying before new request...")
+    try:
+        response = send_gemini_request(gemini_url, payload)
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        print(f"\n Pending Gemini retry failed (HTTP {status}): {exc}")
+        if exc.response is not None:
+            print(f"Error Details: {exc.response.text}")
+        return False
+    except requests.exceptions.RequestException as exc:
+        print(f"\n Pending Gemini retry failed (network): {exc}")
+        return False
+
+    try:
+        body = response.json()
+        ai_evaluation = extract_gemini_candidate_text(body)
+        if not ai_evaluation.strip():
+            print("\n Pending Gemini response had no text parts.")
+            return False
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        print(f"\n Pending Gemini response could not be parsed: {exc}")
+        return False
+
+    try:
+        parsed = parse_gemini_json_response(ai_evaluation)
+        save_latest_evaluation(parsed)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(f"\n Pending Gemini output was not valid evaluation JSON: {exc}")
+        return False
+    except OSError as exc:
+        print(f"\n Could not save latest evaluation after pending retry: {exc}")
+        return False
+
+    print("\n✅ Pending Gemini payload sent successfully:\n")
+    print("=" * 50)
+    print(ai_evaluation)
+    print("=" * 50)
+    try:
+        overwrite_then_delete(PENDING_PAYLOAD_PATH)
+        print("\n Pending payload file securely removed.")
+    except OSError as exc:
+        print(f"\n Evaluation saved but could not remove pending file: {exc}")
+    return True
+
+
 # ==========================================
 # 2. THE PIPELINE ORCHESTRATOR
 # ==========================================
@@ -168,24 +403,68 @@ def main():
         
     print(f"\n Pipeline Complete. {len(all_papers)} papers normalized and saved to {filename}")
 
-    #wake up OpenClaw to process data
-    print("\n Waking up OpenClaw Literature Evaluator...")
+    # API handoff to Gemini 
+    print("\n Sending data directly to Gemini API...")
+    
+    #  Replace this with your actual Gemini API key. 
+    # (If you push this to GitHub later, make sure to use os.environ.get("GEMINI_API_KEY") instead!)
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
+    payload = None
+    
     try:
-        # This simulates typing 'openclaw run ...' into the terminal
-        subprocess.run([
-            "openclaw", 
-            "skills", 
-            "LiteratureEvaluator",
-            filename,
-            "--base-url", "http://host.docker.internal:8080/v1",
-            #"--api-key", "sk-local"
-        ], check=True)
-        print("\n Agent Evaluation Complete.")
+        consume_pending_payload()
+
+        skill_path = os.path.join("Skills", "skills.md")
+        # 1. Read your OpenClaw Skill file to use as the "System Instruction"
+        with open(skill_path, "r", encoding="utf-8") as skill_file:
+            rubric_prompt = strip_yaml_frontmatter(skill_file.read())
+
+        # 2. Build a compact payload with links-only metadata.
+        compact_papers = build_compact_paper_list(all_papers)
+        payload = build_gemini_payload(rubric_prompt, compact_papers)
         
-    except subprocess.CalledProcessError as e:
-        print(f"\n The agent crashed during evaluation: {e}")
+        # 3. Fire the request directly to Google's servers
+        response = send_gemini_request(gemini_url, payload)
+        
+        # If Gemini throws an error (like an invalid API key), this will catch it
+        # 4. Extract and print the AI's response (merge all text parts)
+        response_body = response.json()
+        ai_evaluation = extract_gemini_candidate_text(response_body)
+        if not ai_evaluation.strip():
+            print("\n Gemini response contained no text in candidate parts.")
+            return
+        parsed = parse_gemini_json_response(ai_evaluation)
+        save_latest_evaluation(parsed)
+        
+        print("\n✅ Gemini Evaluation Complete:\n")
+        print("="*50)
+        print(ai_evaluation)
+        print("="*50)
+        
+        # (Later, you will forward 'ai_evaluation' to the WhatsApp API here!)
+
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else None
+        if status_code == 429:
+            if payload is not None:
+                save_pending_payload(gemini_url, payload)
+                print(f" Saved request payload to '{PENDING_PAYLOAD_PATH}' for retry after quota reset.")
+                print(" The pending payload will be overwritten and deleted after a successful resend.")
+            else:
+                print(" Pending payload already exists and could not be resent due to quota.")
+            print("\n⚠️ Gemini quota exceeded (429).")
+            return
+        print(f"\n❌ Gemini API HTTP error: {e}")
+        if e.response is not None:
+            print(f"Error Details: {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"\n❌ Gemini API Connection failed: {e}")
+        # Print the detailed error message from Google if available
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Error Details: {e.response.text}")
     except FileNotFoundError:
-        print("\n OpenClaw is not installed or not in the system PATH.")
+        print("\n❌ Could not find the SKILL file. Make sure 'Skills/skills.md' exists.")
 
 
 

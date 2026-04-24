@@ -52,3 +52,6 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+#cursor folder / files
+.cursor/ 
