@@ -5,6 +5,8 @@ from datetime import datetime
 import os
 import secrets
 
+from telegram_bot import format_top_message_plain, load_top_papers, run_send
+
 MODEL_NAME = "gemini-2.5-flash"
 PENDING_PAYLOAD_PATH = os.path.join("data", "pending_gemini_payload.json")
 LATEST_EVALUATION_PATH = os.path.join("data", "latest_evaluation.json")
@@ -436,13 +438,47 @@ def main():
             return
         parsed = parse_gemini_json_response(ai_evaluation)
         save_latest_evaluation(parsed)
-        
+    
+        print("\n📨 Triggering Telegram send...")
+        run_send() # This will read the latest evaluation we just saved and send it to Telegram
+
         print("\n✅ Gemini Evaluation Complete:\n")
         print("="*50)
         print(ai_evaluation)
         print("="*50)
         
         # (Later, you will forward 'ai_evaluation' to the WhatsApp API here!)
+
+
+        # ==========================================
+        # 5. THE TELEGRAM DISPATCHER
+        # ==========================================
+        
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        
+        if not bot_token or not chat_id:
+            print("❌ Error: Telegram credentials not found in environment variables!")
+            return
+
+        telegram_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        
+        
+        papers = load_top_papers()
+        safe_message = format_top_message_plain(papers)
+
+        payload = {
+        "chat_id": chat_id,
+        "text": safe_message
+        }
+        
+        #tg_response = requests.post(telegram_url, json=payload, timeout=10)
+        #tg_response.raise_for_status()
+        
+        print("\n🚀 Pipeline Complete! Check your phone.")
+
+
+
 
     except requests.exceptions.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else None
